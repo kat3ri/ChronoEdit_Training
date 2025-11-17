@@ -8,12 +8,13 @@ accelerate==1.8.1
 diffusers==0.35.2
 peft==0.17.1
 megatron-core==0.12.1
-peft==0.15.2
+#peft==0.15.2
 transformer-engine==1.13.0
 transformers==4.57.1
 ninja
 qwen-vl-utils==0.0.14
 #flash-attn==2.6.3
+qwen-omni-utils
 
 # Data processing
 numpy==1.26.4  # Using 1.26.4 for stability (2.2.6 in req2.txt may have compatibility issues)
