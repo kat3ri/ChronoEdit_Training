@@ -15,6 +15,8 @@ ninja
 qwen-vl-utils==0.0.14
 #flash-attn==2.6.3
 qwen-omni-utils
+diffsynth==1.1.9
+
 
 # Data processing
 numpy==1.26.4  # Using 1.26.4 for stability (2.2.6 in req2.txt may have compatibility issues)
