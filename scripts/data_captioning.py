@@ -222,7 +222,7 @@ def generate_caption(input_image_path, output_image_path, model, processor, max_
     system_prompt = """You are an image-editing instruction specialist.
 For every pair of images the user provides – the first image is the original, the second is the desired result – note that these two images are the first and last frames from a video clip. 
 
-First, examine if there are any obvious visual changes between the two images. If there are no noticeable changes, simply output: "no change"
+First, examine if there are any obvious visual changes between the two images. Pay special attention to added skin details, blemishes, fine lines, freckles, wrinkles, etc. The changes may be minor so examine them close. If there are no noticeable changes, simply output: "no change"
 
 If there are changes, your job is to write a single, clear, English instruction that would let an editing model transform the first image into the second.
 
@@ -234,7 +234,7 @@ Output requirements (only apply if changes are detected):
 
 3. Focus on changes to the image itself. If a person is present in the images, describe how the person's action, apperance or position changes, but do not describe what the person is doing if it is similar in the two images.
 
-4. Mention what to edit, how it should look afterwards (geometry, illumination, colour, pose, object state, relative position, etc.), and where (spatial phrases like "top left corner", "centre", "foreground").
+4. Mention what to edit, how it should look afterwards (level of detail, geometry, illumination, colour, pose, object state, relative position, etc.), and where (spatial phrases like "top left corner", "centre", "foreground").
 
 5. Keep the instruction self-contained, ≤ 200 words, and free of apologetic or meta language.
 
@@ -310,11 +310,15 @@ Your task is NOT to output the final answer or the image. Instead, you must:
 
 Below is an example of how your output should look. You can include reasoning about the context, potential user intentions, relevant background knowledge, and how you would form the answer. The length of outputs should be **around 80 - 100 words**. Always start with "The user wants to ..."
 
-Example Output:
+Example Output 1:
 The user wants to make the knight kneel on his right knee while keeping the rest of the pose intact. 
 The knight should lower his stance so his right leg bends to the ground in a kneeling position, with the left leg bent upright to support balance. 
 The shield with the NVIDIA logo should still be held up firmly in his left hand, angled forward in a defensive posture, while the right hand continues gripping the weapon. 
-The armor reflections, proportions, and medieval style should remain consistent, emphasizing a powerful and respectful kneeling stance."""
+The armor reflections, proportions, and medieval style should remain consistent, emphasizing a powerful and respectful kneeling stance.
+
+Example Output2: 
+The skin texture on the cheek and jawline is slightly more visible, with minor blemishes and pores becoming more apparent. The lighting remains consistent, but the overall appearance of the skin seems slightly more textured and less smooth in the second image. The eyes and eyebrows remain unchanged, maintaining the same gaze and expression.
+"""
 
     # Create messages for CoT generation
     messages = [
