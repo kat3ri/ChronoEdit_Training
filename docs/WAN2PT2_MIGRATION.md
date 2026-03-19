@@ -95,13 +95,19 @@ The following files have been created as a scaffold for WAN 2.2 MoE support:
 | `chronoedit/_src/configs/chronoedit/defaults/net_moe.py` | Network configs: High (top-4) and Low (top-2) variants |
 | `chronoedit/_src/configs/chronoedit/defaults/model_moe.py` | Model configs: FSDP and DDP wrappers |
 | `chronoedit/_src/configs/chronoedit/experiment/wan2pt2/base.py` | Experiment definitions for MoE training |
+| `chronoedit/_src/modules/gemma3.py` | Gemma 3 12B text encoder (drop-in for UMT5, dim=4096) |
+| `scripts/extract_gemma3.py` | Offline Gemma 3 embedding extraction script |
+| `chronoedit/_src/modules/siglip.py` | SigLIP SO400M vision encoder (replaces CLIP, dim=1152) |
+| `chronoedit/_src/configs/common/defaults/conditioner_enhanced.py` | SigLIP + dual-text conditioner configs (4 variants) |
 
 ### Modified Files
 
 | File | Change |
 |------|--------|
 | `chronoedit/_src/models/__init__.py` | Exports `WANMOEDiffusionModel` (fixes broken import) |
-| `chronoedit/_src/configs/chronoedit/config.py` | Registers MoE net and model configs |
+| `chronoedit/_src/configs/chronoedit/config.py` | Registers MoE net/model configs + enhanced conditioners |
+| `chronoedit/_src/networks/wan2pt1.py` | Added `img_dim`, `use_dual_text`, `secondary_text_dim` to WanModel; MLPProj uses `in_dim` |
+| `chronoedit/_src/networks/wan2pt2_moe.py` | Same encoder upgrade params for MoE backbone |
 
 ### What Still Needs Implementation
 
@@ -214,118 +220,148 @@ Cross-attention with visual tokens
 
 **CLIP** (1280-dim, 257 tokens) provides additional image conditioning for I2V/edit models.
 
-### Swappable Components
+### ✅ Implemented: Option A — Replace UMT5 with Gemma 3 12B
 
-The text encoding pipeline has **three intervention points**, each with different trade-offs:
+**Status: Fully implemented.** Gemma 3 12B is a drop-in replacement for UMT5-XXL since both output `text_dim=4096`.
 
-#### Option A: Replace UMT5 with a Stronger Encoder (Recommended)
+**New files:**
+- `chronoedit/_src/modules/gemma3.py` — `Gemma3EncoderModel` wrapper
+- `scripts/extract_gemma3.py` — Offline batch extraction script
 
-The text embeddings are **pre-extracted offline** and stored as tensors, meaning the encoder is completely decoupled from training. To swap encoders:
+**Usage:**
 
-1. **Replace the extraction script** (`scripts/extract_umt5.py`) with the new encoder.
-2. **Update `text_dim`** in the network config if the embedding dimension changes.
-3. **Re-extract all dataset embeddings.**
+```bash
+# Step 1: Extract Gemma 3 embeddings (offline, before training)
+python scripts/extract_gemma3.py --csv_path data/metadata.csv
 
-**Recommended Replacements (2026 state of the art):**
+# Step 2: Update dataset config to load from gemma3/ instead of umt5/
+# In your dataset config, change the embedding path column from 'umt5' to 'gemma3'
 
-| Encoder | Dim | Max Tokens | Strengths | Integration Effort |
-|---------|-----|------------|-----------|-------------------|
-| **Gemma 3 Encoder** | 4096 | 8192 | Strong multilingual, long-context reasoning | Low (dim matches) |
-| **T5-XXL-v1.1** | 4096 | 512 | Drop-in replacement for UMT5, better English | Minimal (dim matches) |
-| **LLaMA-3.3 70B (encoder layers)** | 8192 | 128K | Superior semantic understanding, instruction following | Medium (dim change needed) |
-| **Qwen3-VL encoder** | 5120 | 32K | Vision-language understanding, edit-aware prompts | Medium (dim change) |
-| **DFN-CLIP ViT-H** | 1280 | 257 | Better CLIP for image conditioning | Low (swap CLIP only) |
-
-**Example: Swapping to Gemma 3 (drop-in, same dim):**
-
-```python
-# scripts/extract_gemma3_embeddings.py
-from transformers import AutoModel, AutoTokenizer
-
-model = AutoModel.from_pretrained("google/gemma-3-12b", output_hidden_states=True)
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-12b")
-
-def extract_text_embedding(text, max_length=512):
-    inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True, padding="max_length")
-    with torch.no_grad():
-        outputs = model(**inputs)
-    embeddings = outputs.last_hidden_state  # [1, 512, 4096] ← same dim!
-    return embeddings
+# Step 3: Train normally — no network config changes needed (dim=4096 matches)
+torchrun --nproc_per_node=8 -m scripts.train \
+    --config=chronoedit/_src/configs/chronoedit/config.py \
+    -- experiment="edit_14B_skip_pe8"
 ```
 
-No network changes needed since `text_dim=4096` is unchanged.
+**Why Gemma 3?**
+- Same hidden dimension (4096) → zero network changes
+- Better instruction following and semantic understanding than UMT5
+- Multilingual support (important for international edit prompts)
+- 8192 max token length (vs 512 for UMT5) — can be leveraged for longer edit descriptions
 
-**Example: Swapping to a larger encoder (dim change required):**
+### ✅ Implemented: Option B — Dual-Encoder Conditioning
 
-```python
-# In chronoedit/_src/configs/chronoedit/defaults/net_moe.py, change text_dim:
-WAN2PT2_MOE_14B_HIGH_EDIT = L(EditWanMOEModel)(
-    ...
-    text_dim=8192,  # Changed from 4096 to match new encoder
-    ...
-)
+**Status: Fully implemented.** Use two text encoders simultaneously for richer edit semantics.
+
+**New files:**
+- `chronoedit/_src/configs/common/defaults/conditioner_enhanced.py` — Dual-text conditioner configs
+  - `DualTextImg2VidCondition` — Condition dataclass with `crossattn_emb_secondary`
+  - `SecondaryTextAttr` / `SecondaryTextAttrEmptyStringDrop` — Secondary stream embedders
+  - `DualTextImg2VidConditioner` — Conditioner that produces the dual-text condition
+
+**Modified files:**
+- `chronoedit/_src/networks/wan2pt1.py` — Added `use_dual_text`, `secondary_text_dim` to `WanModel`
+- `chronoedit/_src/networks/wan2pt2_moe.py` — Same params for MoE backbone
+
+**Architecture:**
+
+```
+Primary text embeddings (e.g., Gemma 3)          Secondary text embeddings (e.g., UMT5)
+  [B, 512, 4096]                                    [B, 512, 4096]
+       ↓                                                  ↓
+  text_embedding (Linear→GELU→Linear)            text_embedding_secondary (Linear→GELU→Linear)
+  [B, 512, dim]                                    [B, 512, dim]
+       ↓                                                  ↓
+       └──────────── concat (dim=1) ──────────────────────┘
+                           ↓
+                    [B, 1024, dim]
+                           ↓
+              (+ CLIP/SigLIP tokens if I2V)
+                           ↓
+                  Cross-attention context
 ```
 
-Then update the network's `text_embedding` projection:
-```python
-# In wan2pt2_moe.py or wan2pt1.py — WanModel/WanMOEModel.__init__:
-self.text_embedding = nn.Sequential(
-    nn.Linear(text_dim, dim),  # 8192 → 5120 (auto-adjusted via config)
-    nn.GELU(approximate="tanh"),
-    nn.Linear(dim, dim)
-)
+**Usage:**
+
+```bash
+# Step 1: Pre-extract embeddings from BOTH encoders
+python scripts/extract_umt5.py --csv_path data/metadata.csv        # Primary
+python scripts/extract_gemma3.py --csv_path data/metadata.csv      # Secondary
+
+# Step 2: Update dataset to load both embedding columns
+
+# Step 3: Train with dual-text conditioner
+torchrun --nproc_per_node=8 -m scripts.train \
+    --config=chronoedit/_src/configs/chronoedit/config.py \
+    -- experiment="edit_14B_skip_pe8" \
+       conditioner=i2v_conditioner_dual_text \
+       model.config.net.use_dual_text=true \
+       model.config.net.secondary_text_dim=4096
 ```
 
-Since `text_dim` is already a constructor parameter in `WanModel`/`WanMOEModel`, changing it in the config is sufficient — no code changes needed.
+**Registered conditioner configs:**
 
-#### Option B: Dual-Encoder Conditioning
+| Config Name | Text | Image | Notes |
+|---|---|---|---|
+| `i2v_conditioner_dual_text` | Dual (primary + secondary) | CLIP | Dual text + existing CLIP |
+| `i2v_conditioner_dual_text_siglip` | Dual (primary + secondary) | SigLIP | Full upgrade (see below) |
 
-Use two text encoders simultaneously for richer semantic understanding:
+### ✅ Implemented: Option C — Upgrade CLIP to SigLIP
 
-```python
-# New conditioner config adding a second text stream
-DualTextConditionerConfig = L(Img2VidWan2pt1Conditioner)(
-    text=L(TextAttr)(
-        input_key=["t5_text_embeddings"],      # Primary (UMT5 / Gemma)
-        dropout_rate=0.2,
-    ),
-    text_secondary=L(TextAttr)(
-        input_key=["llm_text_embeddings"],      # Secondary (LLaMA / Qwen)
-        dropout_rate=0.2,
-    ),
-    wanclip=L(Wan2pt1CLIPEmb)(
-        input_key=["images", "video", WAN2PT1_I2V_COND_LATENT_KEY],
-        dropout_rate=0.0,
-        dtype="bfloat16",
-    ),
-)
+**Status: Fully implemented.** SigLIP SO400M replaces CLIP ViT-H/14 for better image-edit alignment.
+
+**New files:**
+- `chronoedit/_src/modules/siglip.py` — `SigLIPModel` and `SigLIPEmb`
+
+**Modified files:**
+- `chronoedit/_src/networks/wan2pt1.py` — Added `img_dim` param to `WanModel` (default 1280 for backward compat, set to 1152 for SigLIP)
+- `chronoedit/_src/networks/wan2pt2_moe.py` — Same `img_dim` param
+- `MLPProj` — Updated to use `in_dim` parameter instead of hardcoded 1280
+
+**Key differences from CLIP:**
+
+| Feature | CLIP ViT-H/14 | SigLIP SO400M |
+|---------|--------------|---------------|
+| Output dim | 1280 | 1152 |
+| Image size | 224×224 | 384×384 |
+| Loss function | Softmax cross-entropy | Sigmoid cross-entropy |
+| Patch tokens | 256 + 1 CLS = 257 | 729 (no CLS) |
+| Alignment quality | Good | Better (fine-grained) |
+
+**Usage:**
+
+```bash
+# Train with SigLIP (single text encoder)
+torchrun --nproc_per_node=8 -m scripts.train \
+    --config=chronoedit/_src/configs/chronoedit/config.py \
+    -- experiment="edit_14B_skip_pe8" \
+       conditioner=i2v_conditioner_siglip \
+       model.config.net.img_dim=1152
+
+# Train with SigLIP + dual text (full upgrade)
+torchrun --nproc_per_node=8 -m scripts.train \
+    --config=chronoedit/_src/configs/chronoedit/config.py \
+    -- experiment="edit_14B_skip_pe8" \
+       conditioner=i2v_conditioner_dual_text_siglip \
+       model.config.net.img_dim=1152 \
+       model.config.net.use_dual_text=true
 ```
 
-This requires:
-1. Extending `T2VCondition` with a `crossattn_emb_secondary` field.
-2. Adding a second `text_embedding` projection in the network.
-3. Concatenating or cross-attending the two text streams before cross-attention with visual tokens.
+**Registered conditioner configs:**
 
-#### Option C: Enhanced CLIP for Better Image-Edit Awareness
-
-Replace the CLIP image encoder with a model that understands editing instructions:
-
-```python
-# In chronoedit/_src/modules/clip.py, swap CLIPModel:
-class EditAwareCLIPEmb(Wan2pt1CLIPEmb):
-    def __init__(self, ...):
-        super().__init__(...)
-        # Use InternVL2.5 or SigLIP-SO400M for better edit understanding
-        self.clip_model = AutoModel.from_pretrained("google/siglip-so400m-patch14-384")
-        self.model_dim = 1152  # SigLIP dim (update img_emb projection)
-```
+| Config Name | Text | Image | Notes |
+|---|---|---|---|
+| `i2v_conditioner_siglip` | Single | SigLIP | SigLIP only, drop-in |
+| `i2v_conditioner_siglip_empty_string_drop` | Single (w/ empty-string drop) | SigLIP | Training robustness |
+| `i2v_conditioner_dual_text_siglip` | Dual | SigLIP | Maximum capability |
 
 ### Recommendation
 
-For ChronoEdit's editing use case, the **highest-impact text encoder improvement** would be:
+For ChronoEdit's editing use case, the **highest-impact upgrade path** is:
 
-1. **Replace UMT5 with Gemma 3 12B encoder** (same dim, better instruction understanding) — this is a drop-in replacement requiring only a new extraction script.
-2. **Upgrade CLIP to SigLIP-SO400M** for better visual-semantic alignment of edit instructions.
+1. **Start with Gemma 3** (zero network changes, just re-extract embeddings)
+2. **Add SigLIP** (change `img_dim=1152` in network config, swap conditioner)
+3. **Add dual-text** if compute allows (adds secondary text stream for deeper semantics)
 
 ---
 
