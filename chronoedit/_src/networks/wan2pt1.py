@@ -577,7 +577,7 @@ class MLPProj(torch.nn.Module):
             torch.nn.LayerNorm(out_dim),
         )
         if flf_pos_emb:  # NOTE: we only use this for `flf2v`
-            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
+            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, in_dim))
 
     def init_weights(self):
         self.proj[0].reset_parameters()
@@ -624,6 +624,9 @@ class WanModel(WeightTrainingStat):
         cp_comm_type: str = "p2p",
         postpone_checkpoint: bool = False,
         conv_patchify: bool = False,
+        img_dim: int = 1280,
+        use_dual_text: bool = False,
+        secondary_text_dim: int = 4096,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -663,6 +666,12 @@ class WanModel(WeightTrainingStat):
                 Enable concat padding mask
             cp_comm_type (str, *optional*, defaults to 'p2p'):
                 CP communication type passed to TE.
+            img_dim (`int`, *optional*, defaults to 1280):
+                Input dimension for image/CLIP embeddings (1280 for CLIP, 1152 for SigLIP)
+            use_dual_text (`bool`, *optional*, defaults to False):
+                Enable dual text encoder conditioning (two text streams)
+            secondary_text_dim (`int`, *optional*, defaults to 4096):
+                Input dimension for the secondary text encoder embeddings
         """
 
         super().__init__()
@@ -687,6 +696,9 @@ class WanModel(WeightTrainingStat):
         self.concat_padding_mask = concat_padding_mask
         self.cp_comm_type = cp_comm_type
         self.conv_patchify = conv_patchify
+        self.img_dim = img_dim
+        self.use_dual_text = use_dual_text
+        self.secondary_text_dim = secondary_text_dim
         # embeddings
         in_dim = in_dim + 1 if self.concat_padding_mask else in_dim
         if self.conv_patchify:
@@ -695,6 +707,12 @@ class WanModel(WeightTrainingStat):
             self.patch_embedding = nn.Linear(in_dim * patch_size[0] * patch_size[1] * patch_size[2], dim)
 
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
+
+        # Secondary text embedding projection (for dual-encoder conditioning)
+        if use_dual_text:
+            self.text_embedding_secondary = nn.Sequential(
+                nn.Linear(secondary_text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+            )
 
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
@@ -734,7 +752,7 @@ class WanModel(WeightTrainingStat):
         )
 
         if model_type == "i2v" or model_type == "flf2v":
-            self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
+            self.img_emb = MLPProj(img_dim, dim, flf_pos_emb=model_type == "flf2v")
 
         # initialize weights
         self.init_weights()
@@ -753,6 +771,7 @@ class WanModel(WeightTrainingStat):
         padding_mask: Optional[torch.Tensor] = None,
         is_uncond=False,
         slg_layers=None,
+        crossattn_emb_secondary=None,
         **kwargs,
     ):
         r"""
@@ -771,6 +790,8 @@ class WanModel(WeightTrainingStat):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y_B_C_T_H_W (Tensor, *optional*):
                 Conditional video inputs for image-to-video mode, shape [B, C_in, T, H, W]
+            crossattn_emb_secondary (Tensor, *optional*):
+                Secondary text encoder embeddings for dual-encoder conditioning, shape [B, L2, D2]
 
         Returns:
             Tensor:
@@ -823,6 +844,11 @@ class WanModel(WeightTrainingStat):
         # context
         context_lens = None
         context_B_L_D = self.text_embedding(crossattn_emb)
+
+        # dual text encoder: project and concatenate secondary text embeddings
+        if crossattn_emb_secondary is not None and self.use_dual_text:
+            context_secondary = self.text_embedding_secondary(crossattn_emb_secondary)
+            context_B_L_D = torch.concat([context_B_L_D, context_secondary], dim=1)
 
         if frame_cond_crossattn_emb_B_L_D is not None:
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
@@ -910,6 +936,8 @@ class WanModel(WeightTrainingStat):
             fully_shard(block, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.head, mesh=mesh, reshard_after_forward=False)
         fully_shard(self.text_embedding, mesh=mesh, reshard_after_forward=True)
+        if self.use_dual_text:
+            fully_shard(self.text_embedding_secondary, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.time_embedding, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.patch_embedding, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.time_projection, mesh=mesh, reshard_after_forward=True)

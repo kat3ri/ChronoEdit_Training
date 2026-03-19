@@ -22,7 +22,9 @@ from chronoedit._ext.imaginaire import config
 from  chronoedit._ext.imaginaire.trainer import ImaginaireTrainer as Trainer
 from  chronoedit._ext.imaginaire.utils.config_helper import import_all_modules_from_package
 from chronoedit._src.configs.chronoedit.defaults.model import edit_register_model
+from chronoedit._src.configs.chronoedit.defaults.model_moe import edit_register_model_moe
 from chronoedit._src.configs.chronoedit.defaults.net import edit_register_net
+from chronoedit._src.configs.chronoedit.defaults.net_moe import edit_register_net_moe
 from chronoedit._src.configs.chronoedit.defaults.callbacks import edit_register_callbacks
 from chronoedit._src.configs.chronoedit.defaults.dataloader import edit_register_dataloader
 
@@ -37,6 +39,7 @@ from chronoedit._src.configs.i2v_wan.config import register_optimizer, \
     register_checkpoint, \
     register_ckpt_type
 
+from chronoedit._src.configs.common.defaults.conditioner_enhanced import register_enhanced_conditioner
 from chronoedit._src.configs.common.defaults.dataloader import register_training_and_val_data_no_cosmos
 @attrs.define(slots=False)
 class Config(config.Config):
@@ -93,6 +96,7 @@ def make_config() -> Config:
     register_callbacks()
     register_net()
     register_conditioner()
+    register_enhanced_conditioner()
     register_ema()
     register_tokenizer()
     register_checkpoint()
@@ -101,7 +105,9 @@ def make_config() -> Config:
     # register edit dataloader
     edit_register_dataloader()
     edit_register_model()
+    edit_register_model_moe()
     edit_register_net()
+    edit_register_net_moe()
     edit_register_callbacks()
 
     # experiment config are defined in the experiment folder
