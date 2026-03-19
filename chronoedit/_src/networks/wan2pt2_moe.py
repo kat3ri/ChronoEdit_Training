@@ -412,6 +412,10 @@ class WanMOEModel(WeightTrainingStat):
         num_experts: int = 48,
         top_k: int = 4,
         aux_loss_coeff: float = 1e-2,
+        # --- Encoder upgrades ---
+        img_dim: int = 1280,
+        use_dual_text: bool = False,
+        secondary_text_dim: int = 4096,
     ):
         super().__init__()
 
@@ -437,6 +441,9 @@ class WanMOEModel(WeightTrainingStat):
         self.num_experts = num_experts
         self.top_k = top_k
         self.aux_loss_coeff = aux_loss_coeff
+        self.img_dim = img_dim
+        self.use_dual_text = use_dual_text
+        self.secondary_text_dim = secondary_text_dim
 
         # --- embeddings (identical to WanModel) ---
         _in_dim = in_dim + 1 if self.concat_padding_mask else in_dim
@@ -448,6 +455,13 @@ class WanMOEModel(WeightTrainingStat):
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
         )
+
+        # Secondary text embedding projection (for dual-encoder conditioning)
+        if use_dual_text:
+            self.text_embedding_secondary = nn.Sequential(
+                nn.Linear(secondary_text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
+            )
+
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
@@ -482,7 +496,7 @@ class WanMOEModel(WeightTrainingStat):
         )
 
         if model_type in ("i2v", "flf2v"):
-            self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
+            self.img_emb = MLPProj(img_dim, dim, flf_pos_emb=model_type == "flf2v")
 
         # --- initialise ---
         self.init_weights()
@@ -503,6 +517,7 @@ class WanMOEModel(WeightTrainingStat):
         padding_mask: Optional[torch.Tensor] = None,
         is_uncond=False,
         slg_layers=None,
+        crossattn_emb_secondary=None,
         **kwargs,
     ):
         """Forward pass — identical to ``WanModel`` except MoE blocks return
@@ -555,6 +570,12 @@ class WanMOEModel(WeightTrainingStat):
         # context
         context_lens = None
         context_B_L_D = self.text_embedding(crossattn_emb)
+
+        # dual text encoder: project and concatenate secondary text embeddings
+        if crossattn_emb_secondary is not None and self.use_dual_text:
+            context_secondary = self.text_embedding_secondary(crossattn_emb_secondary)
+            context_B_L_D = torch.concat([context_B_L_D, context_secondary], dim=1)
+
         if frame_cond_crossattn_emb_B_L_D is not None:
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
@@ -614,6 +635,13 @@ class WanMOEModel(WeightTrainingStat):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        if self.use_dual_text:
+            for m in self.text_embedding_secondary.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
         for m in self.time_embedding.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
@@ -641,6 +669,8 @@ class WanMOEModel(WeightTrainingStat):
             fully_shard(block, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.head, mesh=mesh, reshard_after_forward=False)
         fully_shard(self.text_embedding, mesh=mesh, reshard_after_forward=True)
+        if self.use_dual_text:
+            fully_shard(self.text_embedding_secondary, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.time_embedding, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.patch_embedding, mesh=mesh, reshard_after_forward=True)
         fully_shard(self.time_projection, mesh=mesh, reshard_after_forward=True)

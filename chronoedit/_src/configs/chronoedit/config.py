@@ -39,6 +39,7 @@ from chronoedit._src.configs.i2v_wan.config import register_optimizer, \
     register_checkpoint, \
     register_ckpt_type
 
+from chronoedit._src.configs.common.defaults.conditioner_enhanced import register_enhanced_conditioner
 from chronoedit._src.configs.common.defaults.dataloader import register_training_and_val_data_no_cosmos
 @attrs.define(slots=False)
 class Config(config.Config):
@@ -95,6 +96,7 @@ def make_config() -> Config:
     register_callbacks()
     register_net()
     register_conditioner()
+    register_enhanced_conditioner()
     register_ema()
     register_tokenizer()
     register_checkpoint()
